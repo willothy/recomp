@@ -1,34 +1,29 @@
-use std::num::NonZeroU32;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
 use anyhow::Result;
 
-use tracing::{info, warn};
+use tracing::info;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt::time::UtcTime;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{EnvFilter, Layer};
-use wgpu::{SurfaceTarget, SurfaceTargetUnsafe, WindowHandle};
-use winit::event_loop::{EventLoop, EventLoopBuilder, EventLoopWindowTarget};
-use winit::platform::x11::EventLoopWindowTargetExtX11;
-use x11rb::protocol::composite::ConnectionExt;
-use x11rb::protocol::xproto::{CreateWindowAux, Screen, WindowClass};
+use tracing_subscriber::Layer;
+
+use wgpu::SurfaceTargetUnsafe;
+use x11rb::protocol::xproto::Screen;
 use x11rb_async::blocking::BlockingConnection;
 
-use x11rb::COPY_DEPTH_FROM_PARENT;
+#[cfg(not(debug_assertions))]
+use tracing_subscriber::EnvFilter;
 
 #[cfg(debug_assertions)]
 const DEBUG_LOG_LEVEL: LevelFilter = LevelFilter::DEBUG;
 
 pub struct Session<'a> {
-    // conn: RustConnection,
-    // conn: BlockingConnection<XCBConnection>,
-    // screen_num: usize,
     conn: XConn,
     overlay_win: xproto::Window,
-    root_size: (u32, u32),
+    root_size: (u16, u16),
     surface: wgpu::Surface<'a>,
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -42,19 +37,9 @@ use x11rb_async::protocol::xproto::{self, ConnectionExt as _};
 
 impl<'a> Session<'a> {
     pub async fn new(conn: XConn) -> Result<Self> {
-        // let conn = BlockingConnection::new(Arc::clone(&raw));
-        let (root, root_size) = {
-            let screen: &Screen = &conn.conn.setup().roots[conn.screen_num];
-            (
-                screen.root,
-                (
-                    screen.width_in_pixels as u32,
-                    screen.height_in_pixels as u32,
-                ),
-            )
-        };
-
-        // conn.ver
+        let s: &Screen = &conn.setup().roots[conn.screen_num];
+        let root = s.root;
+        let root_size = (s.width_in_pixels, s.height_in_pixels);
 
         let ver = conn
             .composite_query_version(
@@ -83,7 +68,7 @@ impl<'a> Session<'a> {
 
         let win = winit::raw_window_handle::XcbWindowHandle::new(win_id.try_into()?);
         let scr = winit::raw_window_handle::XcbDisplayHandle::new(
-            Some(NonNull::new(conn.raw.get_raw_xcb_connection()).expect("Non-null")),
+            Some(NonNull::new(conn.as_raw_connection()).expect("Non-null")),
             conn.screen_num.try_into()?,
         );
 
@@ -136,8 +121,8 @@ impl<'a> Session<'a> {
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
-            width: root_size.0,
-            height: root_size.1,
+            width: root_size.0 as u32,
+            height: root_size.1 as u32,
             present_mode: wgpu::PresentMode::Fifo,
             alpha_mode,
             view_formats: vec![],
@@ -147,6 +132,7 @@ impl<'a> Session<'a> {
         surface.configure(&device, &config);
 
         conn.map_window(win_id).await?.check().await?;
+        // Sync with the X server
         conn.flush().await?;
 
         Ok(Self {
@@ -198,26 +184,22 @@ impl<'a> Session<'a> {
         // submit will accept anything that implements IntoIter
         self.queue.submit(std::iter::once(encoder.finish()));
 
-        // self.conn.damage_add(self.win_id, 0).await?;
         output.present();
 
         Ok(())
     }
 
     pub async fn run(&self) -> Result<()> {
-        use winit::platform::x11::*;
-        // let ev = EventLoopBuilder::new().with_x11().build()?;
-
-        // winit::window::WindowBuilder::new().;
-
+        // NOTE: this is just for debugging, so I don't lock myself out of my computer lol
+        //
+        // Do *NOT* remove this and then "cargo run." You will need to reboot your computer.
         static I: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        // ev.run(move |e, t| {})?;
         loop {
             self.render().ok();
             if I.fetch_add(1, std::sync::atomic::Ordering::Relaxed) > 200 {
                 break;
             }
-            println!("Event: {:?}", self.conn.wait_for_event().await?);
+            // println!("Event: {:?}", self.conn.wait_for_event().await?);
         }
 
         Ok(())
@@ -244,7 +226,7 @@ impl XConn {
         self.screen_num
     }
 
-    pub fn as_ptr(&self) -> *mut std::ffi::c_void {
+    pub fn as_raw_connection(&self) -> *mut std::ffi::c_void {
         self.raw.get_raw_xcb_connection()
     }
 }
@@ -276,8 +258,9 @@ async fn main() -> Result<()> {
         .with(perf_layer)
         .init();
 
-    let (conn, screen_num) = x11rb::xcb_ffi::XCBConnection::connect(None)?;
-    let conn = XConn::new(Arc::new(conn), screen_num);
+    let conn = x11rb::xcb_ffi::XCBConnection::connect(None)
+        .map(|(conn, screen)| XConn::new(Arc::new(conn), screen))?;
+
     info!("Connected to X11 server");
 
     let session = Session::new(conn).await?;
