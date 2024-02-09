@@ -1,0 +1,60 @@
+[package]
+name = "recomp"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.79"
+tracing = { version = "0.1.40", features = ["async-await"] }
+tracing-subscriber = { version = "0.3.18", features = [
+  "serde",
+  "env-filter",
+  "time",
+] }
+tracing-timing = "0.6.0"
+wgpu = "0.19.1"
+winit = "0.29.10"
+
+[dependencies.tokio]
+version = "1.36.0"
+features = ["full"]
+
+[dependencies.x11rb-async]
+version = "0.13.0"
+features = [
+  # X11 Extensions
+  "composite",
+  "damage",
+  "glx",
+  "present",
+  "render",
+  "shape",
+  "sync",
+  "xfixes",
+  "randr",
+
+  # Library features
+  "extra-traits",
+  "allow-unsafe-code",
+]
+
+[dependencies.x11rb]
+version = "0.13.0"
+features = [
+  # X11 Extensions
+  "composite",
+  "damage",
+  "glx",
+  "present",
+  "render",
+  "shape",
+  "sync",
+  "xfixes",
+  "randr",
+
+  # Library features
+  "image",
+  "extra-traits",
+  "allow-unsafe-code",
+  "resource_manager",
+]
