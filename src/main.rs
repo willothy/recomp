@@ -10,6 +10,7 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::Layer;
 
+use wgpu::rwh::{XcbDisplayHandle, XcbWindowHandle};
 use wgpu::SurfaceTargetUnsafe;
 use x11rb::protocol::xproto::Screen;
 use x11rb_async::blocking::BlockingConnection;
@@ -66,8 +67,8 @@ impl<'a> Session<'a> {
             ..Default::default()
         });
 
-        let win = winit::raw_window_handle::XcbWindowHandle::new(win_id.try_into()?);
-        let scr = winit::raw_window_handle::XcbDisplayHandle::new(
+        let win = XcbWindowHandle::new(win_id.try_into()?);
+        let scr = XcbDisplayHandle::new(
             Some(NonNull::new(conn.as_raw_connection()).expect("Non-null")),
             conn.screen_num.try_into()?,
         );

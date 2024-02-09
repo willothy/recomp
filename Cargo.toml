@@ -13,7 +13,6 @@ tracing-subscriber = { version = "0.3.18", features = [
 ] }
 tracing-timing = "0.6.0"
 wgpu = "0.19.1"
-winit = "0.29.10"
 
 [dependencies.tokio]
 version = "1.36.0"
