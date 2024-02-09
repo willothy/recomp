@@ -249,12 +249,6 @@ impl XConn {
     }
 }
 
-impl AsRef<XCBConnection> for XConn {
-    fn as_ref(&self) -> &XCBConnection {
-        &self.raw
-    }
-}
-
 impl std::ops::Deref for XConn {
     type Target = BlockingConnection<XCBConnection>;
 
