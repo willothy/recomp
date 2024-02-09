@@ -1,4 +1,6 @@
 use std::ffi::{CStr, CString};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::net::UnixStream;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
@@ -13,7 +15,8 @@ use tracing_subscriber::Layer;
 
 use wgpu::rwh::{RawDisplayHandle, RawWindowHandle, XcbDisplayHandle, XcbWindowHandle};
 use wgpu::SurfaceTargetUnsafe;
-use x11rb::protocol::xproto::Screen;
+use x11rb::connection::Connection;
+use x11rb::protocol::xproto::{Screen, Setup};
 use x11rb_async::blocking::BlockingConnection;
 
 #[cfg(not(debug_assertions))]
@@ -23,7 +26,8 @@ use tracing_subscriber::EnvFilter;
 const DEBUG_LOG_LEVEL: LevelFilter = LevelFilter::DEBUG;
 
 pub struct Compositor<'a> {
-    conn: XConn,
+    conn: RustConnection,
+    raw: Arc<XCBConnection>,
     overlay_win: xproto::Window,
     #[allow(unused)]
     root_size: (u16, u16),
@@ -34,9 +38,36 @@ pub struct Compositor<'a> {
 }
 
 use x11rb::xcb_ffi::XCBConnection;
-use x11rb_async::connection::Connection;
+use x11rb_async::connection::Connection as _;
 use x11rb_async::protocol::composite::ConnectionExt as _;
 use x11rb_async::protocol::xproto::{self};
+use x11rb_async::rust_connection::{DefaultStream, RustConnection};
+
+type Stream = x11rb::rust_connection::DefaultStream;
+type AsyncStream = x11rb_async::rust_connection::DefaultStream;
+
+struct Seq<T>(T);
+
+impl<T> Seq<T> {
+    pub fn then<F, R>(self, f: impl FnOnce(T) -> R) -> R {
+        f(self.0)
+    }
+}
+
+pub trait Then<T> {
+    fn then<F, R>(self, f: F) -> R
+    where
+        F: FnOnce(T) -> R;
+}
+
+impl<T> Then<T> for T {
+    fn then<F, R>(self, f: F) -> R
+    where
+        F: FnOnce(T) -> R,
+    {
+        f(self)
+    }
+}
 
 /// The main compositor state struct, which manages the [`XConn`],
 /// the [`wgpu`] surface, and the [`wgpu`] render pipeline.
@@ -48,9 +79,24 @@ impl<'a> Compositor<'a> {
     /// until you are ready to start rendering.
     pub async fn new(display: Option<&str>) -> Result<Self> {
         let display = display.map(CString::new).transpose()?;
-        let conn = x11rb::xcb_ffi::XCBConnection::connect(display.as_deref())
-            .map(|(conn, screen)| XConn::new(Arc::new(conn), screen))?;
-        let s: &Screen = &conn.setup().roots[conn.screen_num];
+        info!("Connecting to X11 server");
+        let (raw, screen) = XCBConnection::connect(display.as_deref())?;
+        info!("Connected to X11 server");
+
+        let fd = raw.as_raw_fd();
+
+        let (stream, (family, auth)) =
+            Stream::from_unix_stream(unsafe { UnixStream::from_raw_fd(fd) })
+                .map(|(stream, rest)| AsyncStream::new(stream).map(|x| (x, rest)))??;
+
+        info!("Established stream");
+
+        let (conn, fut) = RustConnection::for_connected_stream(stream, raw.setup().clone())?;
+
+        tokio::spawn(fut);
+        info!("Ready");
+
+        let s: &Screen = &conn.setup().roots[screen];
         let root = s.root;
         let root_size = (s.width_in_pixels, s.height_in_pixels);
 
@@ -87,8 +133,11 @@ impl<'a> Compositor<'a> {
         let surface = unsafe {
             instance.create_surface_unsafe(SurfaceTargetUnsafe::RawHandle {
                 raw_display_handle: RawDisplayHandle::Xcb(XcbDisplayHandle::new(
-                    Some(conn.as_raw_connection()),
-                    conn.screen().try_into()?,
+                    Some(
+                        raw.get_raw_xcb_connection()
+                            .then(|ptr| NonNull::new_unchecked(ptr)),
+                    ),
+                    screen.try_into()?,
                 )),
                 raw_window_handle: RawWindowHandle::Xcb(XcbWindowHandle::new(win_id.try_into()?)),
             })?
@@ -99,7 +148,7 @@ impl<'a> Compositor<'a> {
                 &wgpu::RequestAdapterOptions {
                     // Should this be configurable at some point?
                     // Should high power be the default?
-                    power_preference: wgpu::PowerPreference::default(),
+                    power_preference: wgpu::PowerPreference::HighPerformance,
                     compatible_surface: Some(&surface),
                     force_fallback_adapter: false,
                 }
@@ -150,6 +199,7 @@ impl<'a> Compositor<'a> {
 
         Ok(Self {
             conn,
+            raw: Arc::new(raw),
             root_size,
             surface,
             queue,
@@ -283,6 +333,8 @@ async fn main() -> Result<()> {
     info!("Connected to X11 server");
 
     let session = Compositor::new(None).await?;
+
+    info!("Created compositor");
 
     session.run().await?;
 
