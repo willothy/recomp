@@ -1,3 +1,4 @@
+use std::ffi::{CStr, CString};
 use std::ptr::NonNull;
 use std::sync::Arc;
 
@@ -10,7 +11,7 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::Layer;
 
-use wgpu::rwh::{XcbDisplayHandle, XcbWindowHandle};
+use wgpu::rwh::{RawDisplayHandle, RawWindowHandle, XcbDisplayHandle, XcbWindowHandle};
 use wgpu::SurfaceTargetUnsafe;
 use x11rb::protocol::xproto::Screen;
 use x11rb_async::blocking::BlockingConnection;
@@ -21,9 +22,10 @@ use tracing_subscriber::EnvFilter;
 #[cfg(debug_assertions)]
 const DEBUG_LOG_LEVEL: LevelFilter = LevelFilter::DEBUG;
 
-pub struct Session<'a> {
+pub struct Compositor<'a> {
     conn: XConn,
     overlay_win: xproto::Window,
+    #[allow(unused)]
     root_size: (u16, u16),
     surface: wgpu::Surface<'a>,
     device: wgpu::Device,
@@ -34,17 +36,29 @@ pub struct Session<'a> {
 use x11rb::xcb_ffi::XCBConnection;
 use x11rb_async::connection::Connection;
 use x11rb_async::protocol::composite::ConnectionExt as _;
-use x11rb_async::protocol::xproto::{self, ConnectionExt as _};
+use x11rb_async::protocol::xproto::{self};
 
-impl<'a> Session<'a> {
-    pub async fn new(conn: XConn) -> Result<Self> {
+/// The main compositor state struct, which manages the [`XConn`],
+/// the [`wgpu`] surface, and the [`wgpu`] render pipeline.
+impl<'a> Compositor<'a> {
+    /// Create a new compositor instance. This will create a new overlay window and
+    /// initialize a wgpu surface and render pipeline for it.
+    ///
+    /// Note that this will show the window immediately, so it should not be called
+    /// until you are ready to start rendering.
+    pub async fn new(display: Option<&str>) -> Result<Self> {
+        let display = display.map(CString::new).transpose()?;
+        let conn = x11rb::xcb_ffi::XCBConnection::connect(display.as_deref())
+            .map(|(conn, screen)| XConn::new(Arc::new(conn), screen))?;
         let s: &Screen = &conn.setup().roots[conn.screen_num];
         let root = s.root;
         let root_size = (s.width_in_pixels, s.height_in_pixels);
 
+        // It is required to query the composite extension before making any other
+        // composite extension requests, or those requests will fail with BadRequest.
         let ver = conn
             .composite_query_version(
-                999, //
+                999, // idk just pick a big number
                 0,
             )
             .await?
@@ -53,13 +67,12 @@ impl<'a> Session<'a> {
 
         info!("Composite extension version: {:?}", ver);
 
-        let win = conn
+        let win_id = conn
             .composite_get_overlay_window(root)
             .await?
             .reply()
-            .await?;
-
-        let win_id = win.overlay_win;
+            .await?
+            .overlay_win;
 
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             // backends: wgpu::Backends::GL, // setting this to GL fails for some reason
@@ -67,22 +80,25 @@ impl<'a> Session<'a> {
             ..Default::default()
         });
 
-        let win = XcbWindowHandle::new(win_id.try_into()?);
-        let scr = XcbDisplayHandle::new(
-            Some(NonNull::new(conn.as_raw_connection()).expect("Non-null")),
-            conn.screen_num.try_into()?,
-        );
-
+        // Safety: we get the raw connection from the XCBConnection, which is a valid XCB connection
+        // so this should be safe.
+        //
+        // We need this to convert the x11tb connection to something wgpu can use.
         let surface = unsafe {
             instance.create_surface_unsafe(SurfaceTargetUnsafe::RawHandle {
-                raw_display_handle: scr.into(),
-                raw_window_handle: win.into(),
+                raw_display_handle: RawDisplayHandle::Xcb(XcbDisplayHandle::new(
+                    Some(conn.as_raw_connection()),
+                    conn.screen().try_into()?,
+                )),
+                raw_window_handle: RawWindowHandle::Xcb(XcbWindowHandle::new(win_id.try_into()?)),
             })?
         };
 
         let adapter = instance
             .request_adapter({
                 &wgpu::RequestAdapterOptions {
+                    // Should this be configurable at some point?
+                    // Should high power be the default?
                     power_preference: wgpu::PowerPreference::default(),
                     compatible_surface: Some(&surface),
                     force_fallback_adapter: false,
@@ -102,26 +118,26 @@ impl<'a> Session<'a> {
             )
             .await?;
 
-        let surface_caps = surface.get_capabilities(&adapter);
+        let capabilities = surface.get_capabilities(&adapter);
 
-        let surface_format = surface_caps
+        let format = capabilities
             .formats
             .iter()
             .filter(|f| f.is_srgb())
             .next()
-            .or_else(|| surface_caps.formats.get(0))
-            .ok_or_else(|| anyhow::anyhow!("No sRGB surface format found"))?
-            .clone();
+            .or_else(|| capabilities.formats.get(0))
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("No sRGB surface format found"))?;
 
-        let alpha_mode = surface_caps
+        let alpha_mode = capabilities
             .alpha_modes
             .get(0)
-            .ok_or_else(|| anyhow::anyhow!("No supported usage found"))?
-            .clone();
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("No supported usage found"))?;
 
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format: surface_format,
+            format,
             width: root_size.0 as u32,
             height: root_size.1 as u32,
             present_mode: wgpu::PresentMode::Fifo,
@@ -132,10 +148,6 @@ impl<'a> Session<'a> {
 
         surface.configure(&device, &config);
 
-        conn.map_window(win_id).await?.check().await?;
-        // Sync with the X server
-        conn.flush().await?;
-
         Ok(Self {
             conn,
             root_size,
@@ -145,6 +157,14 @@ impl<'a> Session<'a> {
             config,
             overlay_win: win_id,
         })
+    }
+
+    pub fn resize(&mut self, width: u16, height: u16) {
+        // TBD: Can this actually happen in a compositor? not sure how screen attach/detach is
+        // handled.
+        self.config.width = width as u32;
+        self.config.height = height as u32;
+        self.surface.configure(&self.device, &self.config);
     }
 
     pub fn render(&self) -> Result<()> {
@@ -227,8 +247,9 @@ impl XConn {
         self.screen_num
     }
 
-    pub fn as_raw_connection(&self) -> *mut std::ffi::c_void {
-        self.raw.get_raw_xcb_connection()
+    pub fn as_raw_connection(&self) -> NonNull<std::ffi::c_void> {
+        // Safety: XCB should hopefully never hand us a null pointer.
+        unsafe { NonNull::new_unchecked(self.raw.get_raw_xcb_connection()) }
     }
 }
 
@@ -259,12 +280,9 @@ async fn main() -> Result<()> {
         .with(perf_layer)
         .init();
 
-    let conn = x11rb::xcb_ffi::XCBConnection::connect(None)
-        .map(|(conn, screen)| XConn::new(Arc::new(conn), screen))?;
-
     info!("Connected to X11 server");
 
-    let session = Session::new(conn).await?;
+    let session = Compositor::new(None).await?;
 
     session.run().await?;
 
