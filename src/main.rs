@@ -13,17 +13,14 @@ use tracing_subscriber::Layer;
 
 use wgpu::rwh::{RawDisplayHandle, RawWindowHandle, XcbDisplayHandle, XcbWindowHandle};
 use wgpu::SurfaceTargetUnsafe;
+use x11rb::protocol::composite::Redirect;
+use x11rb::protocol::shape::SK;
 use x11rb::protocol::xproto::Screen;
 use x11rb_async::blocking::BlockingConnection;
 
-#[cfg(not(debug_assertions))]
-use tracing_subscriber::EnvFilter;
-
-#[cfg(debug_assertions)]
-const DEBUG_LOG_LEVEL: LevelFilter = LevelFilter::DEBUG;
-
 pub struct Compositor<'a> {
     conn: XConn,
+    root_win: xproto::Window,
     overlay_win: xproto::Window,
     #[allow(unused)]
     root_size: (u16, u16),
@@ -36,6 +33,7 @@ pub struct Compositor<'a> {
 use x11rb::xcb_ffi::XCBConnection;
 use x11rb_async::connection::Connection;
 use x11rb_async::protocol::composite::ConnectionExt as _;
+use x11rb_async::protocol::xfixes::ConnectionExt;
 use x11rb_async::protocol::xproto::{self};
 
 /// The main compositor state struct, which manages the [`XConn`],
@@ -50,13 +48,15 @@ impl<'a> Compositor<'a> {
         let display = display.map(CString::new).transpose()?;
         let conn = x11rb::xcb_ffi::XCBConnection::connect(display.as_deref())
             .map(|(conn, screen)| XConn::new(Arc::new(conn), screen))?;
-        let s: &Screen = &conn.setup().roots[conn.screen_num];
-        let root = s.root;
+        let setup = conn.setup();
+        let s: &Screen = &setup.roots[conn.screen_num];
+
+        let root: xproto::Window = s.root;
         let root_size = (s.width_in_pixels, s.height_in_pixels);
 
         // It is required to query the composite extension before making any other
         // composite extension requests, or those requests will fail with BadRequest.
-        let ver = conn
+        let composite_version = conn
             .composite_query_version(
                 999, // idk just pick a big number
                 0,
@@ -64,8 +64,16 @@ impl<'a> Compositor<'a> {
             .await?
             .reply()
             .await?;
+        info!("Composite extension version: {:?}", composite_version);
 
-        info!("Composite extension version: {:?}", ver);
+        let xfixes_version = conn.xfixes_query_version(999, 0).await?.reply().await?;
+        info!("XFixes extension version: {:?}", xfixes_version);
+
+        // Redirect all current and future children of the root window.
+        conn.composite_redirect_subwindows(root, Redirect::AUTOMATIC)
+            .await?
+            .check()
+            .await?;
 
         let win_id = conn
             .composite_get_overlay_window(root)
@@ -73,6 +81,23 @@ impl<'a> Compositor<'a> {
             .reply()
             .await?
             .overlay_win;
+        info!("Overlay window: {:?}", win_id);
+
+        // Allow event pass-through to the root window
+        let region = conn.generate_id().await?;
+        conn.xfixes_create_region(region, &[])
+            .await?
+            .check()
+            .await?;
+        // conn.xfixes_set_window_shape_region(win_id, SK::BOUNDING, 0, 0, region)
+        //     .await?
+        //     .check()
+        //     .await?;
+        conn.xfixes_set_window_shape_region(win_id, SK::INPUT, 0, 0, region)
+            .await?
+            .check()
+            .await?;
+        conn.xfixes_destroy_region(region).await?.check().await?;
 
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             // backends: wgpu::Backends::GL, // setting this to GL fails for some reason
@@ -156,6 +181,7 @@ impl<'a> Compositor<'a> {
             device,
             config,
             overlay_win: win_id,
+            root_win: root,
         })
     }
 
@@ -180,27 +206,25 @@ impl<'a> Compositor<'a> {
                 label: Some("Render Encoder"),
             });
 
-        {
-            let _ = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Render Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.1,
-                            g: 0.2,
-                            b: 0.3,
-                            a: 1.0,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                occlusion_query_set: None,
-                timestamp_writes: None,
-            });
-        }
+        encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("Render Pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: 0.1,
+                        g: 0.2,
+                        b: 0.5,
+                        a: 1.0,
+                    }),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            occlusion_query_set: None,
+            timestamp_writes: None,
+        });
 
         // submit will accept anything that implements IntoIter
         self.queue.submit(std::iter::once(encoder.finish()));
@@ -227,15 +251,29 @@ impl<'a> Compositor<'a> {
     }
 }
 
+impl Drop for Compositor<'_> {
+    fn drop(&mut self) {
+        let conn = self.conn.clone();
+        let root = self.root_win;
+        tokio::spawn(async move {
+            conn.composite_unredirect_subwindows(root, Redirect::AUTOMATIC)
+                .await?
+                .check()
+                .await
+        });
+    }
+}
+
+#[derive(Clone)]
 pub struct XConn {
     raw: Arc<XCBConnection>,
-    conn: BlockingConnection<XCBConnection>,
+    conn: Arc<BlockingConnection<XCBConnection>>,
     screen_num: usize,
 }
 
 impl XConn {
     pub fn new(raw: Arc<XCBConnection>, screen_num: usize) -> Self {
-        let conn = BlockingConnection::new(Arc::clone(&raw));
+        let conn = Arc::new(BlockingConnection::new(Arc::clone(&raw)));
         Self {
             raw,
             conn,
@@ -268,10 +306,17 @@ async fn main() -> Result<()> {
         .with_file(true)
         .with_timer(UtcTime::rfc_3339())
         .with_filter(
-            #[cfg(debug_assertions)]
-            DEBUG_LOG_LEVEL,
-            #[cfg(not(debug_assertions))]
-            EnvFilter::from_default_env(),
+            tracing_subscriber::filter::targets::Targets::new().with_targets([
+                (
+                    "recomp",
+                    #[cfg(debug_assertions)]
+                    LevelFilter::TRACE,
+                    #[cfg(not(debug_assertions))]
+                    tracing_subscriber::filter::EnvFilter::from_default_env(),
+                ),
+                ("wgpu", LevelFilter::WARN),
+                ("tokio", LevelFilter::WARN),
+            ]),
         );
     let perf_layer = tracing_timing::Builder::default()
         .layer(|| tracing_timing::Histogram::new(2).expect("to create histogram"));
