@@ -22,15 +22,18 @@ features = ["full"]
 version = "0.13.0"
 features = [
   # X11 Extensions
-  "composite",
-  "damage",
-  "glx",
-  "present",
-  "render",
-  "shape",
-  "sync",
-  "xfixes",
-  "randr",
+  # "composite",
+  # "damage",
+  # "glx",
+  # "present",
+  # "render",
+  # "shape",
+  # "sync",
+  # "xfixes",
+  # "randr",
+  # "xinput",
+
+  "all-extensions",
 
   # Library features
   "extra-traits",

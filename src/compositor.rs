@@ -1,15 +1,22 @@
 use std::{ffi::CString, sync::Arc};
 
 use anyhow::Result;
-use tracing::info;
+use tracing::{info, warn};
 use wgpu::{
     rwh::{RawDisplayHandle, RawWindowHandle, XcbDisplayHandle, XcbWindowHandle},
     SurfaceTargetUnsafe,
 };
-use x11rb::protocol::{composite::Redirect, shape::SK, xproto};
+use x11rb::protocol::{
+    composite::Redirect,
+    shape::SK,
+    xproto::{self, CreateWindowAux, WindowClass},
+};
 use x11rb_async::{
-    connection::Connection as _,
-    protocol::{composite::ConnectionExt as _, xfixes::ConnectionExt as _},
+    connection::Connection,
+    protocol::{
+        composite::ConnectionExt as _, damage::ConnectionExt, xfixes::ConnectionExt as _,
+        xproto::ConnectionExt as _,
+    },
 };
 
 use crate::connection::XConn;
@@ -39,10 +46,10 @@ impl<'a> Compositor<'a> {
         let conn = x11rb::xcb_ffi::XCBConnection::connect(display.as_deref())
             .map(|(conn, screen)| XConn::new(Arc::new(conn), screen))?;
         let setup = conn.setup();
-        let s: &xproto::Screen = &setup.roots[conn.screen()];
+        let screen: &xproto::Screen = &setup.roots[conn.screen()];
 
-        let root: xproto::Window = s.root;
-        let root_size = (s.width_in_pixels, s.height_in_pixels);
+        let root: xproto::Window = screen.root;
+        let root_size = (screen.width_in_pixels, screen.height_in_pixels);
 
         // It is required to query the composite extension before making any other
         // composite extension requests, or those requests will fail with BadRequest.
@@ -59,6 +66,42 @@ impl<'a> Compositor<'a> {
         let xfixes_version = conn.xfixes_query_version(999, 0).await?.reply().await?;
         info!("XFixes extension version: {:?}", xfixes_version);
 
+        let xdamage_version = conn.damage_query_version(999, 0).await?.reply().await?;
+        info!("XDamage extension version: {:?}", xdamage_version);
+
+        // let wid = conn.generate_id().await?;
+        // conn.create_window(
+        //     0,
+        //     wid,
+        //     root,
+        //     0,
+        //     0,
+        //     root_size.0,
+        //     root_size.1,
+        //     0,
+        //     WindowClass::COPY_FROM_PARENT,
+        //     0,
+        //     &CreateWindowAux::default(),
+        // )
+        // .await?
+        // .check()
+        // .await?;
+        //
+        // let selection = conn
+        //     .intern_atom(false, format!("REGISTER_PROP{}", conn.screen()).as_bytes())
+        //     .await?
+        //     .reply()
+        //     .await?;
+
+        // selection.atom
+
+        // conn.set_selection_owner(wid, selection.atom, 0u32)
+        //     .await?
+        //     .check()
+        //     .await?;
+
+        // conn.xutf
+
         // Redirect all current and future children of the root window.
         conn.composite_redirect_subwindows(root, Redirect::AUTOMATIC)
             .await?
@@ -72,6 +115,9 @@ impl<'a> Compositor<'a> {
             .await?
             .overlay_win;
         info!("Overlay window: {:?}", win_id);
+
+        // let tree = conn.query_tree(root).await?.reply().await?;
+        // info!("Tree: {:?}", tree);
 
         // Allow event pass-through to the root window
         let region = conn.generate_id().await?;
@@ -225,15 +271,75 @@ impl<'a> Compositor<'a> {
     }
 
     pub async fn run(&self) -> Result<()> {
-        // NOTE: this is just for debugging, so I don't lock myself out of my computer lol
-        //
-        // Do *NOT* remove this and then "cargo run." You will need to reboot your computer.
-        static I: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         loop {
-            self.render().ok();
-            if I.fetch_add(1, std::sync::atomic::Ordering::Relaxed) > 200 {
-                break;
+            self.render()?;
+            match self.conn.poll_for_event()? {
+                Some(ev) => {
+                    match ev {
+                        x11rb::protocol::Event::Unknown(_) => info!("Unknown event"),
+                        x11rb::protocol::Event::Error(err) => warn!("X11 Error: {:?}", err),
+                        x11rb::protocol::Event::ButtonPress(btn) => {
+                            info!("ButtonPress: {:?}", btn);
+                        }
+                        x11rb::protocol::Event::CreateNotify(ev) => {
+                            info!("CreateNotify: {:?}", ev);
+                        }
+                        x11rb::protocol::Event::DestroyNotify(ev) => {
+                            info!("DestroyNotify: {:?}", ev);
+                        }
+                        x11rb::protocol::Event::EnterNotify(ev) => {
+                            info!("EnterNotify: {:?}", ev);
+                        }
+                        x11rb::protocol::Event::FocusIn(ev) => {
+                            info!("FocusIn: {:?}", ev);
+                        }
+                        x11rb::protocol::Event::FocusOut(ev) => {
+                            info!("FocusOut: {:?}", ev);
+                        }
+                        x11rb::protocol::Event::KeyPress(ev) => {
+                            info!("KeyPress: {:?}", ev);
+                        }
+                        x11rb::protocol::Event::KeyRelease(ev) => {
+                            info!("KeyRelease: {:?}", ev);
+                        }
+                        x11rb::protocol::Event::LeaveNotify(ev) => {
+                            info!("LeaveNotify: {:?}", ev);
+                        }
+                        x11rb::protocol::Event::MapNotify(ev) => {
+                            info!("MapNotify: {:?}", ev);
+                        }
+                        x11rb::protocol::Event::MapRequest(ev) => {
+                            info!("MapRequest: {:?}", ev);
+                        }
+                        x11rb::protocol::Event::MappingNotify(ev) => {
+                            info!("MappingNotify: {:?}", ev);
+                        }
+                        x11rb::protocol::Event::PropertyNotify(ev) => {
+                            info!("PropertyNotify: {:?}", ev);
+                        }
+                        x11rb::protocol::Event::ReparentNotify(ev) => {
+                            info!("ReparentNotify: {:?}", ev);
+                        }
+                        x11rb::protocol::Event::UnmapNotify(ev) => {
+                            info!("UnmapNotify: {:?}", ev);
+                        }
+                        x11rb::protocol::Event::VisibilityNotify(ev) => {
+                            info!("VisibilityNotify: {:?}", ev);
+                        }
+                        x11rb::protocol::Event::DamageNotify(ev) => {
+                            info!("DamageNotify: {:?}", ev);
+                        }
+                        ev => {
+                            warn!("Unhandled event: {:?}", ev);
+                        }
+                    };
+                    break;
+                }
+                None => {}
             }
+            // if I.fetch_add(1, std::sync::atomic::Ordering::Relaxed) > 200 {
+            //     break;
+            // }
             // println!("Event: {:?}", self.conn.wait_for_event().await?);
         }
 
